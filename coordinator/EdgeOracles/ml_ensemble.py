@@ -1,29 +1,89 @@
+# -*- coding: utf-8 -*-
 from ml_engine import *
 from online_learning import *
+import pickle
+import os
 
 class EnsembleLearning:
-    def __init__(self, save_model_file = None, dataset_path=None):
+    def __init__(self, save_model_file = None, dataset_path=None, classifier='rf'):
         if save_model_file != None:
-            self.rf_model = save_model_file + ".ensemble.rf"
+            self.ml_model = save_model_file + ".ensemble." + classifier
             self.ol_model = save_model_file + ".ensemble.ol"
-            print 'Model is saved here {}'.format(self.rf_model)
-            print 'Model is saved here {}'.format(self.ol_model)
+            #print 'Model is saved here {}'.format(self.ml_model)
+            #print 'Model is saved here {}'.format(self.ol_model)
         else:
-            self.rf_model = None
+            self.ml_model = None
             self.ol_model = None
-        self.online_learning = OnlineLearningModule(self.ol_model, dataset_path=dataset_path)
-        self.rf_engine = MLEngine(self.rf_model, dataset_path=dataset_path)
+        
+        if classifier.endswith('_clf'):
+            self.online_learning = OnlineLearningClassifier(self.ol_model, dataset_path=dataset_path)
+        else:
+            self.online_learning = OnlineLearningModule(self.ol_model, dataset_path=dataset_path)
+        
+        self.ml_engine = MLEngine(self.ml_model, classifier=classifier, dataset_path=dataset_path)
+        self.classifier = classifier
+        
+        self.weight_ml = 0.5
+        self.weight_ol = 0.5
+        self.ADAPTIVE_RATE = 0.1
+        self.load_weights()
+
 
     def predict(self, feature):
-        return (self.rf_engine.predict(feature) + self.online_learning.predict(feature))/2.0
-
+        try:
+            ml_pred = self.ml_engine.predict(feature)
+            ol_pred = self.online_learning.predict(feature)
+            
+            ml_confidence = abs(ml_pred - 0.5) * 2
+            ol_confidence = abs(ol_pred - 0.5) * 2
+            
+            confidence_diff = ml_confidence - ol_confidence
+            self.weight_ml += self.ADAPTIVE_RATE * confidence_diff
+            self.weight_ol = 1 - self.weight_ml
+            
+            prediction = self.weight_ml * ml_pred + self.weight_ol * ol_pred
+            
+            return prediction
+            
+        except Exception as e:
+            print("Prediction error: {}".format(e))
+            return 0.5
+    
     def update_model(self, features, labels):
-        self.rf_engine.update_model(features, labels)
-        self.online_learning.update_model(features, labels)
+        try:
+            self.ml_engine.update_model(features, labels)
+            self.online_learning.update_model(features, labels)
+        except Exception as e:
+            print("Model update error: {}".format(e))
 
     def save_model(self):
-        self.rf_engine.save_model()
+        self.ml_engine.save_model()
         self.online_learning.save_model()
+        
+        if self.ml_model is not None:
+            weights_file = self.ml_model + ".weights"
+            weights_data = {
+                'weight_ml': self.weight_ml,
+                'weight_ol': self.weight_ol
+            }
+            try:
+                pickle.dump(weights_data, open(weights_file, 'wb'))
+            except Exception as e:
+                pass
+        
+    
+    def load_weights(self):
+        if self.ml_model is not None:
+            weights_file = self.ml_model + ".weights"
+            try:
+                if os.path.exists(weights_file):
+                    weights_data = pickle.load(open(weights_file, 'rb'))
+                    self.weight_ml = weights_data.get('weight_ml', 0.5)
+                    self.weight_ol = weights_data.get('weight_ol', 0.5)
+                    return True
+            except Exception as e:
+                pass
+        return False
 
 
 def testEnsemble():
