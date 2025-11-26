@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 #!/usr/bin/env python
 import math
 import utils
@@ -15,6 +16,7 @@ from psutil import virtual_memory
 from online_learning import *
 from ml_engine import *
 from ml_ensemble import *
+import time
 
 # Reachable Bug
 RB_NORM=10000000.0
@@ -66,10 +68,9 @@ class MeuzzOracle:
         self.target_dir = os.path.dirname(os.path.abspath(self.target_prog_cmd).split()[0])
 
         self.get_oracle_config()
-        self.feature_columns = ['reachable label', 'reachable blocks','path length',
-		    'undiscovered neighbours', 'new cov', 'size', 'cmp',
-		    'indcall', 'extcall', 'reached labels', 'queue size',
-		    'mem ops', 'edge difference']
+        self.feature_columns = ['reachable label', 'path length',
+            'undiscovered neighbours', 'new cov', 'size', 'cmp',
+            'indcall', 'extcall', 'reached labels', 'queue size']
         self.data_store = DataStore(self.data_store_file, self.feature_columns)
         self.load_bb2bug_file()     #static collection
         self.load_bb2cov_file()     #static collection
@@ -88,22 +89,47 @@ class MeuzzOracle:
         self.input_to_num_extcall_cache = {}
         self.input_to_num_label_cache = {}
         self.input_to_num_memops_cache = {}
-
+        
         self.initialize_meuzz()
         self.queue_size = None
 
         self.initialize_log_fs()
 
     def initialize_meuzz(self):
+        """
+        Initialize machine learning models
+        """
         if self.meuzz_variant == 'random_forest':
             oracle_info("Initializing RandomForest model")
             self.meuzz = MLEngine(model_dir=self.save_model, dataset_path=self.init_dataset)
+        elif self.meuzz_variant == 'rf_clf':
+            oracle_info("Initializing RandomForest Classifier model")
+            self.meuzz = MLEngine(model_dir=self.save_model, classifier='rf_clf', dataset_path=self.init_dataset)
         elif self.meuzz_variant == 'online_learning':
             oracle_info("Initializing OnlineLearning model")
             self.meuzz = OnlineLearningModule(self.save_model, dataset_path=self.init_dataset)
         elif self.meuzz_variant == 'ensemble':
-            oracle_info("Initializing EnsembleLearning model")
-            self.meuzz = EnsembleLearning(self.save_model, dataset_path=self.init_dataset)
+            try:
+                config = ConfigParser.ConfigParser()
+                config.read(self.config)
+                classifier = config.get("edge oracle", "classifier") if config.has_option("edge oracle", "classifier") else 'rf'
+                oracle_info("Initializing EnsembleLearning model with classifier: {}".format(classifier))
+                self.meuzz = EnsembleLearning(self.save_model, dataset_path=self.init_dataset, classifier=classifier)
+            except Exception as e:
+                oracle_info("Failed to get classifier, using default: {}".format(e))
+                self.meuzz = EnsembleLearning(self.save_model, dataset_path=self.init_dataset)
+        elif self.meuzz_variant == 'xgb':
+            oracle_info("Initializing XGBoost model")
+            self.meuzz = MLEngine(model_dir=self.save_model, classifier='xgb', dataset_path=self.init_dataset)
+        elif self.meuzz_variant == 'xgb_clf':
+            oracle_info("Initializing XGBoost Classifier model")
+            self.meuzz = MLEngine(model_dir=self.save_model, classifier='xgb_clf', dataset_path=self.init_dataset)
+        elif self.meuzz_variant == 'lgbm':
+            oracle_info("Initializing LightGBM model")
+            self.meuzz = MLEngine(model_dir=self.save_model, classifier='lgbm', dataset_path=self.init_dataset)
+        elif self.meuzz_variant == 'lgbm_clf':
+            oracle_info("Initializing LightGBM Classifier model")
+            self.meuzz = MLEngine(model_dir=self.save_model, classifier='lgbm_clf', dataset_path=self.init_dataset)
         else:
             utils.error_msg("unknown meuzz variant: {0}".format(self.meuzz_variant))
 
@@ -279,7 +305,6 @@ class MeuzzOracle:
         stats = []
         features = self.get_features(inputs)
         for entry in features:
-            # calculate potential of each seed
             seed, feature = entry
             stat = {}
             stat['score'] = self.meuzz.predict([feature])
@@ -290,47 +315,52 @@ class MeuzzOracle:
         return stats
 
     def get_reachable_bug(self, seed, _):
-        if not self.input_to_reachable_bug_cache.has_key(seed):
-            if not self.input_to_edges_cache.has_key(seed):
-                self.batch_collect_features(seed, _)
-            edges = self.input_to_edges_cache[seed]
-            reachable = 0
-            for e in set(edges):
-                neighbours = self.get_pair_if_any(e)
-                for ne in neighbours:
-                    if (self.count_all_edges) or (not ne in self.covered_fuzzer_edges):
-                        neighbour_bbl_id = str(((int(self.edge_to_parentBB[ne]) >> 1) ^ int(ne)) & 0xfffff)
-                        try:
-                            ne_score = float(self.bb_bug_map[neighbour_bbl_id])
-                            if ne_score > 0:
-                                is_interesting_edge = True
-                                reachable += ne_score
-                        except KeyError:
-                            pass
-            self.input_to_reachable_bug_cache[seed] = reachable
-        return self.input_to_reachable_bug_cache[seed]
+        try:
+            if not self.input_to_reachable_bug_cache.has_key(seed):
+                if not self.input_to_edges_cache.has_key(seed):
+                    self.batch_collect_features(seed, _)
+                edges = self.input_to_edges_cache[seed]
+                reachable = 0
+                for e in set(edges):
+                    neighbours = self.get_pair_if_any(e)
+                    for ne in neighbours:
+                        if (self.count_all_edges) or (not ne in self.covered_fuzzer_edges):
+                            neighbour_bbl_id = str(((int(self.edge_to_parentBB[ne]) >> 1) ^ int(ne)) & 0xfffff)
+                            try:
+                                ne_score = float(self.bb_bug_map[neighbour_bbl_id])
+                                if ne_score > 0:
+                                    is_interesting_edge = True
+                                    reachable += ne_score
+                            except KeyError:
+                                pass
+                self.input_to_reachable_bug_cache[seed] = reachable
+            return self.input_to_reachable_bug_cache[seed]
+        except KeyError:
+            return 0
 
     def get_reachable_cov(self, seed, _):
-        if not self.input_to_reachable_cov_cache.has_key(seed):
-            if not self.input_to_edges_cache.has_key(seed):
-                self.batch_collect_features(seed, _)
-            edges = self.input_to_edges_cache[seed]
-            reachable = 0
-            for e in set(edges):
-                neighbours = self.get_pair_if_any(e)
-                for ne in neighbours:
-                    if (self.count_all_edges) or (not ne in self.covered_fuzzer_edges):
-                        neighbour_bbl_id = str(((int(self.edge_to_parentBB[ne]) >> 1) ^ int(ne)) & 0xfffff)
-                        try:
-                            ne_score = float(self.bb_cov_map[neighbour_bbl_id])
-                            if ne_score > 0:
-                                is_interesting_edge = True
-                                reachable += ne_score
-                        except KeyError:
-                            # print "warning something is wrong"
-                            pass
-            self.input_to_reachable_cov_cache[seed] = reachable
-        return self.input_to_reachable_cov_cache[seed]
+        try:
+            if not self.input_to_reachable_cov_cache.has_key(seed):
+                if not self.input_to_edges_cache.has_key(seed):
+                    self.batch_collect_features(seed, _)
+                edges = self.input_to_edges_cache[seed]
+                reachable = 0
+                for e in set(edges):
+                    neighbours = self.get_pair_if_any(e)
+                    for ne in neighbours:
+                        if (self.count_all_edges) or (not ne in self.covered_fuzzer_edges):
+                            neighbour_bbl_id = str(((int(self.edge_to_parentBB[ne]) >> 1) ^ int(ne)) & 0xfffff)
+                            try:
+                                ne_score = float(self.bb_cov_map[neighbour_bbl_id])
+                                if ne_score > 0:
+                                    is_interesting_edge = True
+                                    reachable += ne_score
+                            except KeyError:
+                                pass
+                self.input_to_reachable_cov_cache[seed] = reachable
+            return self.input_to_reachable_cov_cache[seed]
+        except KeyError:
+            return 0
 
     def get_ctxt_edge_difference(self, seed, _):
         edges = set(self.input_to_edges_cache[seed])
@@ -356,29 +386,51 @@ class MeuzzOracle:
         return self.input_to_edges_cache[seed]
 
     def get_num_cmp(self, seed, _):
-        if not self.input_to_num_cmp_cache.has_key(seed):
-            self.batch_collect_features(seed, _)
-        return self.input_to_num_cmp_cache[seed]
+        try:
+            if not self.input_to_num_cmp_cache.has_key(seed):
+                self.batch_collect_features(seed, _)
+            return self.input_to_num_cmp_cache[seed]
+        except KeyError:
+            return 0
 
     def get_num_indcall(self, seed, _):
-        if not self.input_to_num_indcall_cache.has_key(seed):
-            self.batch_collect_features(seed, _)
-        return self.input_to_num_indcall_cache[seed]
+        try:
+            if not self.input_to_num_indcall_cache.has_key(seed):
+                self.batch_collect_features(seed, _)
+            return self.input_to_num_indcall_cache[seed]
+        except KeyError:
+            return 0
 
     def get_num_extcall(self, seed, _):
-        if not self.input_to_num_extcall_cache.has_key(seed):
-            self.batch_collect_features(seed, _)
-        return self.input_to_num_extcall_cache[seed]
+        try:
+            if not self.input_to_num_extcall_cache.has_key(seed):
+                self.batch_collect_features(seed, _)
+            return self.input_to_num_extcall_cache[seed]
+        except KeyError:
+            return 0
 
     def get_num_label(self, seed, _):
-        if not self.input_to_num_label_cache.has_key(seed):
-            self.batch_collect_features(seed, _)
-        return self.input_to_num_label_cache[seed]
+        try:
+            if not self.input_to_num_label_cache.has_key(seed):
+                self.batch_collect_features(seed, _)
+            return self.input_to_num_label_cache[seed]
+        except KeyError:
+            return 0
 
     def get_num_memops(self, seed, _):
-        if not self.input_to_num_memops_cache.has_key(seed):
-            self.batch_collect_features(seed, _)
-        return self.input_to_num_memops_cache[seed]
+        try:
+            if not self.input_to_num_memops_cache.has_key(seed):
+                self.batch_collect_features(seed, _)
+            return self.input_to_num_memops_cache[seed]
+        except KeyError:
+            return 0
+
+    def get_queue_size(self, seed, _):
+        """Get current queue size"""
+        if self.queue_size is None:
+            seeds = [os.path.join(self.fuzzer_input_dir, x) for x in self.read_queue()]
+            self.queue_size = len(seeds)
+        return self.queue_size
 
     def pre_filter(self, seeds, covered, max_return = 500):
         ret = []
@@ -452,79 +504,63 @@ class MeuzzOracle:
             "MEM_OP_LOG"        : mopf,
             "ASAN_OPTIONS"      : "detect_odr_violation=0"
         }
-        utils.run_one_with_envs(self.replay_prog_cmd, seed, self.input_mode, envs, 0.2, _)
-        cnum = utils.count_file_items(cf, with_weight=True)
-        icnum = utils.count_file_items(icf, with_weight=True)
-        ecnum = utils.count_file_items(ecf, with_weight=True)
-        lnum = utils.count_file_items(lf, with_weight=True)
-        mopnum = utils.count_file_items(mopf, with_weight=True)
-        if os.path.exists(ef):
-            self.input_to_edges_cache[seed] = utils.read_edges_from_file(ef)
-            self.covered_fuzzer_edges |= set(self.input_to_edges_cache[seed])
-            os.unlink(ef)
-        if os.path.exists(cf):
-            self.input_to_num_cmp_cache[seed] = cnum
-            os.unlink(cf)
-        if os.path.exists(icf):
-            self.input_to_num_indcall_cache[seed] = icnum
-            os.unlink(icf)
-        if os.path.exists(ecf):
-            self.input_to_num_extcall_cache[seed] = ecnum
-            os.unlink(ecf)
-        if os.path.exists(lf):
-            self.input_to_num_label_cache[seed] = lnum
-            os.unlink(lf)
-        if os.path.exists(mopf):
-            self.input_to_num_memops_cache[seed] = mopnum
-            os.unlink(mopf)
-
-    # MEUZZ interfaces
-    def get_feature(self, seed, _):
-        """ Return collected features in a list
-        [reachable labels, path length, undiscovered neihbours, new cov, size]
-        """
-        if self.input_to_feature_cache.has_key(seed):
-            return self.input_to_feature_cache[seed]
-
-        feature = []
-
-        # reachable ubsan bug
-        feature.append(self.get_reachable_bug(seed, _)/RB_NORM)
-        # reachable cov
-        feature.append(self.get_reachable_cov(seed, _)/RC_NORM)
-        # path: the smaller the better
-        feature.append(self.get_path_length(seed, _)/P_NORM)
-        # undiscovered neighbours
-        feature.append(self.get_undiscover_neighbour(seed, _)/UN_NORM)
-        # +cov
-        feature.append(1 if seed.endswith("+cov") else 0)
-        # size: the smaller the better
-        feature.append(os.path.getsize(seed)/S_NORM)
-        # number of cmps on the path
-        feature.append(self.get_num_cmp(seed, _)/CN_NORM)
-        # number of indirect calls on the path
-        feature.append(self.get_num_indcall(seed, _)/ICN_NORM)
-        # number of external calls on the path
-        feature.append(self.get_num_extcall(seed, _)/ECN_NORM)
-        # number of labels on the path
-        feature.append(self.get_num_label(seed, _)/SLN_NORM)
-        # number of seeds in queue right now
-        feature.append(self.queue_size/Q_NORM)
-        # number of memops defined by ASAN
-        feature.append(self.get_num_memops(seed, _)/MOP_NORM)
-        # coverage difference
-        feature.append(self.get_ctxt_edge_difference(seed, _)/CED_NORM)
-
-        self.input_to_feature_cache[seed] = feature
-        # print "seed: ", seed
-        # print "feature: ", feature
-
-        return feature
+        timeouts = [0.2, 1.0]
+        for idx, timeout_val in enumerate(timeouts):
+            utils.run_one_with_envs(self.replay_prog_cmd, seed, self.input_mode, envs, timeout_val, _)
+            cnum = utils.count_file_items(cf, with_weight=True)
+            icnum = utils.count_file_items(icf, with_weight=True)
+            ecnum = utils.count_file_items(ecf, with_weight=True)
+            lnum = utils.count_file_items(lf, with_weight=True)
+            mopnum = utils.count_file_items(mopf, with_weight=True)
+            any_trace = False
+            if os.path.exists(ef):
+                self.input_to_edges_cache[seed] = utils.read_edges_from_file(ef)
+                self.covered_fuzzer_edges |= set(self.input_to_edges_cache[seed])
+                os.unlink(ef)
+                any_trace = True
+            if os.path.exists(cf):
+                self.input_to_num_cmp_cache[seed] = cnum
+                os.unlink(cf)
+                any_trace = True
+            if os.path.exists(icf):
+                self.input_to_num_indcall_cache[seed] = icnum
+                os.unlink(icf)
+                any_trace = True
+            if os.path.exists(ecf):
+                self.input_to_num_extcall_cache[seed] = ecnum
+                os.unlink(ecf)
+                any_trace = True
+            if os.path.exists(lf):
+                self.input_to_num_label_cache[seed] = lnum
+                os.unlink(lf)
+                any_trace = True
+            if os.path.exists(mopf):
+                self.input_to_num_memops_cache[seed] = mopnum
+                os.unlink(mopf)
+                any_trace = True
+            if any_trace:
+                break
+            if idx == 0:
+                print "[MEUZZ] No trace file for seed %s after 0.2s, fallback to 1.0s..." % seed
+        if not self.input_to_edges_cache.has_key(seed):
+            self.input_to_edges_cache[seed] = []
+        if not self.input_to_num_cmp_cache.has_key(seed):
+            self.input_to_num_cmp_cache[seed] = 0
+        if not self.input_to_num_indcall_cache.has_key(seed):
+            self.input_to_num_indcall_cache[seed] = 0
+        if not self.input_to_num_extcall_cache.has_key(seed):
+            self.input_to_num_extcall_cache[seed] = 0
+        if not self.input_to_num_label_cache.has_key(seed):
+            self.input_to_num_label_cache[seed] = 0
+        if not self.input_to_num_memops_cache.has_key(seed):
+            self.input_to_num_memops_cache[seed] = 0
 
     def get_features(self, seeds, _ = False):
         res = []
         for seed in seeds:
-            res.append((seed, self.get_feature(seed, _)))
+            feature = self.get_feature(seed, _)
+            res.append((seed, feature))
+            
         print "Len[i2e cache]: ", len(self.input_to_edges_cache)
         print "Len[i2rb cache]: ", len(self.input_to_reachable_bug_cache)
         print "Len[i2rc cache]: ", len(self.input_to_reachable_cov_cache)
@@ -563,8 +599,6 @@ class MeuzzOracle:
     # called everytime before we make a prediction of seed utilities
     def update_model(self):
         print "trying to update model", self.data_store_file
-        # print self.data_store
-
         entries = self.get_labels(self.meuzz_window)
         to_dump = []
         for entry in entries:
@@ -573,12 +607,12 @@ class MeuzzOracle:
             feature = feature[1]
             data = self.data_store.add_data(label, feature)
             to_dump.append((feature, label))
-
             # only give positive feedback
             if feature > 0:
                 print "update model", feature, label
+                if hasattr(self.meuzz, 'is_classifier') and self.meuzz.is_classifier:
+                    label = 1 if label > 0 else 0
                 self.meuzz.update_model([feature], [label])
-
         self.data_store.dump_data(to_dump, self.data_store_file, window=self.meuzz_window)
         if len(entries) != 0:
             oracle_info("queue size: {0}".format(self.queue_size))
@@ -601,7 +635,72 @@ class MeuzzOracle:
         self.record_explored_fuzzer_edges(seeds)
 
     def collect_label(self, key):
-        return utils.count_children(self.fuzzer_input_dir, key)
+        sync_dir = os.path.dirname(os.path.dirname(self.fuzzer_input_dir))
+        
+        if not os.path.exists(sync_dir):
+            return 0
+        
+        if key.startswith("qsym_instance_conc_"):
+            queue_dir = os.path.join(sync_dir, key, "queue")
+            if os.path.exists(queue_dir):
+                seeds = [f for f in os.listdir(queue_dir) if \
+                        os.path.isfile(os.path.join(queue_dir, f))]
+                return len(seeds)
+        
+        total = 0
+        for d in os.listdir(sync_dir):
+            if d.startswith("qsym_instance_conc_"):
+                queue_dir = os.path.join(sync_dir, d, "queue")
+                if os.path.exists(queue_dir):
+                    seeds = [f for f in os.listdir(queue_dir) if \
+                            os.path.isfile(os.path.join(queue_dir, f))]
+                    
+                    if key == d:
+                        total = len(seeds)
+                        break
+                    
+                    matched_in_dir = 0
+                    for seed in seeds:
+                        try:
+                            _id = seed.split(",")[0].strip("id:")
+                            _src = seed.split(",")[1].strip("sync:").strip("src:")
+                            if key in _src:
+                                matched_in_dir += 1
+                        except Exception:
+                            continue
+                    
+                    total += matched_in_dir
+        
+        return total
+
+    def get_feature(self, seed, _):
+        if self.input_to_feature_cache.has_key(seed):
+            feature = self.input_to_feature_cache[seed]
+        else:
+            feature = []
+            for column in self.feature_columns:
+                if column == 'reachable label':
+                    feature.append(self.get_reachable_bug(seed, _)/RB_NORM)
+                elif column == 'path length':
+                    feature.append(self.get_path_length(seed, _)/P_NORM)
+                elif column == 'undiscovered neighbours':
+                    feature.append(self.get_undiscover_neighbour(seed, _)/UN_NORM)
+                elif column == 'new cov':
+                    feature.append(1 if seed.endswith("+cov") else 0)
+                elif column == 'size':
+                    feature.append(os.path.getsize(seed)/S_NORM)
+                elif column == 'cmp':
+                    feature.append(self.get_num_cmp(seed, _)/CN_NORM)
+                elif column == 'indcall':
+                    feature.append(self.get_num_indcall(seed, _)/ICN_NORM)
+                elif column == 'extcall':
+                    feature.append(self.get_num_extcall(seed, _)/ECN_NORM)
+                elif column == 'reached labels':
+                    feature.append(self.get_num_label(seed, _)/SLN_NORM)
+                elif column == 'queue size':
+                    feature.append(self.get_queue_size(seed, _)/Q_NORM)
+            self.input_to_feature_cache[seed] = feature
+        return feature
 
 class DataStore:
     """This class stores timestamp features and label"""
